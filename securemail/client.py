@@ -26,11 +26,13 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from urllib.parse import parse_qs, quote
 
 from .addressing import (DEFAULT_DOMAIN, address_id, identity_filename,
                          normalize_address)
 from .crypto import Identity, decrypt_message, encrypt_message
+from .server import Store, make_handler
 
 DEFAULT_SERVER = "http://127.0.0.1:8471"
 IDENTITY_DIR = Path.home() / ".securemail"
@@ -82,8 +84,57 @@ def _load_identity(address: str) -> Identity:
     return Identity.load(str(path))
 
 
-def _lookup_keys(server: str, address_id_value: str) -> dict:
-    return _request("GET", f"{server}/keys/{quote(address_id_value, safe='')}")
+def _lookup_keys(server: str, address_id_value: str, allow_missing: bool = False) -> dict | None:
+    try:
+        return _request("GET", f"{server}/keys/{quote(address_id_value, safe='')}")
+    except SystemExit as exc:
+        if allow_missing and str(exc).startswith("server error 404:"):
+            return None
+        raise
+
+
+def _publish_identity(server: str, user_id: str, identity: Identity) -> None:
+    result = _request(
+        "POST", f"{server}/register",
+        {
+            "address_id": user_id,
+            "signing_pub": identity.public_signing_b64(),
+            "encryption_pub": identity.public_encryption_b64(),
+        },
+    )
+    if result.get("registered"):
+        return
+    existing = _lookup_keys(server, user_id, allow_missing=True)
+    if existing is None:
+        raise SystemExit("failed to publish private identity")
+    if (
+        existing["signing_pub"] != identity.public_signing_b64()
+        or existing["encryption_pub"] != identity.public_encryption_b64()
+    ):
+        raise SystemExit("private address already exists with another identity")
+
+
+def _ensure_private_identity(server: str, username: str, default_domain: str) -> Identity:
+    user_id = address_id(username, default_domain)
+    path = _identity_path(username)
+    existing = _lookup_keys(server, user_id, allow_missing=True)
+    if path.exists():
+        identity = Identity.load(str(path))
+        if existing is None:
+            _publish_identity(server, user_id, identity)
+        elif (
+            existing["signing_pub"] != identity.public_signing_b64()
+            or existing["encryption_pub"] != identity.public_encryption_b64()
+        ):
+            raise SystemExit("local private identity does not match the server registration")
+        return identity
+    if existing is not None:
+        raise SystemExit("server already knows this address but the local private key is missing")
+    identity = Identity.generate()
+    _publish_identity(server, user_id, identity)
+    IDENTITY_DIR.mkdir(parents=True, exist_ok=True)
+    identity.save(str(path))
+    return identity
 
 
 def _send_encrypted_message(
@@ -301,20 +352,14 @@ def cmd_register(args) -> int:
         print(f"identity already exists: {path}")
         return 1
     identity = Identity.generate()
-    result = _request(
-        "POST", f"{args.server}/register",
-        {
-            "address_id": user_id,
-            "signing_pub": identity.public_signing_b64(),
-            "encryption_pub": identity.public_encryption_b64(),
-        },
-    )
-    if result.get("registered"):
+    try:
+        _publish_identity(args.server, user_id, identity)
         IDENTITY_DIR.mkdir(parents=True, exist_ok=True)
         identity.save(str(path))
         print(f"registered '{username}' — identity stored in {path} (mode 0600)")
         return 0
-    print(f"username '{username}' is already taken on this server")
+    except SystemExit as exc:
+        print(str(exc))
     return 1
 
 
@@ -366,6 +411,45 @@ def cmd_mailbox(args) -> int:
     return 0
 
 
+def cmd_workspace(args) -> int:
+    username = _normalize_cli_address(args.username, args.domain)
+    private_root = IDENTITY_DIR / "private"
+    private_root.mkdir(parents=True, exist_ok=True)
+    db_path = str(private_root / "securemail.db")
+    relay = ThreadingHTTPServer(
+        (args.server_host, args.server_port),
+        make_handler(Store(db_path)),
+    )
+    relay_thread = Thread(target=relay.serve_forever, daemon=True)
+    relay_thread.start()
+    server_url = f"http://{args.server_host}:{args.server_port}"
+    try:
+        identity = _ensure_private_identity(server_url, username, args.domain)
+        mailbox = ThreadingHTTPServer(
+            (args.host, args.port),
+            _mailbox_handler(server_url, username, identity, args.domain),
+        )
+    except BaseException:
+        relay.shutdown()
+        relay.server_close()
+        raise
+    print(f"private workspace ready for {username}")
+    print(f"mailbox: http://{args.host}:{args.port}")
+    print(f"relay: {server_url}")
+    print("everything stays local and private on your machine.")
+    try:
+        mailbox.serve_forever()
+    except KeyboardInterrupt:
+        print("\nshutting down private workspace")
+    finally:
+        mailbox.shutdown()
+        mailbox.server_close()
+        relay.shutdown()
+        relay.server_close()
+        relay_thread.join(timeout=1)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="securemail",
@@ -396,6 +480,14 @@ def main(argv: list[str] | None = None) -> int:
     p_box.add_argument("--host", default="127.0.0.1")
     p_box.add_argument("--port", type=int, default=8480)
     p_box.set_defaults(func=cmd_mailbox)
+
+    p_workspace = sub.add_parser("workspace", help="start the full private local relay and mailbox")
+    p_workspace.add_argument("username")
+    p_workspace.add_argument("--host", default="127.0.0.1")
+    p_workspace.add_argument("--port", type=int, default=8480)
+    p_workspace.add_argument("--server-host", default="127.0.0.1")
+    p_workspace.add_argument("--server-port", type=int, default=8471)
+    p_workspace.set_defaults(func=cmd_workspace)
 
     args = parser.parse_args(argv)
     return args.func(args)

@@ -17,9 +17,46 @@ class RegisterTest(unittest.TestCase):
             )
             with mock.patch.object(client, "IDENTITY_DIR", Path(tmp)):
                 with mock.patch.object(client, "_request", return_value={"registered": False}):
-                    code = client.cmd_register(args)
+                    with mock.patch.object(client, "_lookup_keys", return_value=None):
+                        code = client.cmd_register(args)
             self.assertEqual(code, 1)
             self.assertEqual(list(Path(tmp).glob("*.json")), [])
+
+
+class EnsureIdentityTest(unittest.TestCase):
+    def test_missing_identity_is_generated_and_saved(self):
+        username = "henrique.de.almeida@securemail.local"
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(client, "IDENTITY_DIR", Path(tmp)):
+                path = client._identity_path(username)
+                with mock.patch.object(client, "_lookup_keys", return_value=None):
+                    with mock.patch.object(client, "_request", return_value={"registered": True}):
+                        identity = client._ensure_private_identity(
+                            "http://127.0.0.1:8471",
+                            username,
+                            "securemail.local",
+                        )
+            self.assertTrue(path.exists())
+            self.assertEqual(
+                identity.public_signing_b64(),
+                client.Identity.load(str(path)).public_signing_b64(),
+            )
+
+    def test_missing_local_private_key_is_rejected_if_server_knows_address(self):
+        username = "henrique.de.almeida@securemail.local"
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(client, "IDENTITY_DIR", Path(tmp)):
+                with mock.patch.object(
+                    client,
+                    "_lookup_keys",
+                    return_value={"signing_pub": "sig", "encryption_pub": "enc"},
+                ):
+                    with self.assertRaises(SystemExit):
+                        client._ensure_private_identity(
+                            "http://127.0.0.1:8471",
+                            username,
+                            "securemail.local",
+                        )
 
 
 class MailboxRenderTest(unittest.TestCase):
