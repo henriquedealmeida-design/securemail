@@ -1,15 +1,15 @@
 """Command-line client.
 
-Identity files live in ~/.securemail/<username>.json with 0600 permissions.
+Identity files live in ~/.securemail/<address>.json with 0600 permissions.
 
 Usage:
-    python -m securemail.client register alice
-    python -m securemail.client send alice bob "meet at 18:00, usual place"
-    python -m securemail.client inbox bob
+    python -m securemail.client register henrique.de.almeida@securemail.local
+    python -m securemail.client send henrique.de.almeida@securemail.local contact@securemail.local "meet at 18:00, usual place"
+    python -m securemail.client inbox contact@securemail.local
 
 Authenticated endpoints (/send, /inbox, /ack) carry two headers:
     X-Timestamp: unix seconds
-    X-Signature: base64 Ed25519 signature over "{username}|{timestamp}"
+    X-Signature: base64 Ed25519 signature over "{address_id}|{timestamp}"
 The server verifies them against the registered public key.
 """
 
@@ -26,7 +26,8 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import quote
 
-from .addressing import DEFAULT_DOMAIN, identity_filename, normalize_address
+from .addressing import (DEFAULT_DOMAIN, address_id, identity_filename,
+                         normalize_address)
 from .crypto import Identity, decrypt_message, encrypt_message
 
 DEFAULT_SERVER = "http://127.0.0.1:8471"
@@ -54,10 +55,10 @@ def _request(
         raise SystemExit(f"cannot reach server at {url} — is it running?")
 
 
-def _auth_headers(identity: Identity, username: str) -> dict:
-    """Sign "{username}|{timestamp}" — proves key possession to the server."""
+def _auth_headers(identity: Identity, address_id_value: str) -> dict:
+    """Sign "{address_id}|{timestamp}" — proves key possession to the server."""
     ts = str(int(time.time()))
-    sig = identity.signing_key.sign(f"{username}|{ts}".encode())
+    sig = identity.signing_key.sign(f"{address_id_value}|{ts}".encode())
     return {"X-Timestamp": ts, "X-Signature": base64.b64encode(sig).decode()}
 
 
@@ -81,6 +82,7 @@ def _load_identity(address: str) -> Identity:
 
 def cmd_register(args) -> int:
     username = _normalize_cli_address(args.username, args.domain)
+    user_id = address_id(username, args.domain)
     path = _identity_path(username)
     if path.exists():
         print(f"identity already exists: {path}")
@@ -91,7 +93,7 @@ def cmd_register(args) -> int:
     result = _request(
         "POST", f"{args.server}/register",
         {
-            "username": username,
+            "address_id": user_id,
             "signing_pub": identity.public_signing_b64(),
             "encryption_pub": identity.public_encryption_b64(),
         },
@@ -106,15 +108,17 @@ def cmd_register(args) -> int:
 def cmd_send(args) -> int:
     sender = _normalize_cli_address(args.sender, args.domain)
     recipient = _normalize_cli_address(args.recipient, args.domain)
+    sender_id = address_id(sender, args.domain)
+    recipient_id = address_id(recipient, args.domain)
     identity = _load_identity(sender)
-    keys = _request("GET", f"{args.server}/keys/{quote(recipient, safe='')}")
+    keys = _request("GET", f"{args.server}/keys/{quote(recipient_id, safe='')}")
     envelope = encrypt_message(
-        identity, sender, recipient, keys["encryption_pub"], args.message
+        identity, sender, sender_id, recipient_id, keys["encryption_pub"], args.message
     )
     _request(
         "POST", f"{args.server}/send",
-        {"recipient": recipient, "envelope": envelope},
-        headers=_auth_headers(identity, sender),
+        {"recipient_id": recipient_id, "envelope": envelope},
+        headers=_auth_headers(identity, sender_id),
     )
     print(f"message encrypted and queued for '{recipient}'")
     print("the server only sees an opaque envelope — not a single word of content.")
@@ -123,32 +127,33 @@ def cmd_send(args) -> int:
 
 def cmd_inbox(args) -> int:
     username = _normalize_cli_address(args.username, args.domain)
+    user_id = address_id(username, args.domain)
     identity = _load_identity(username)
     messages = _request(
-        "GET", f"{args.server}/inbox/{quote(username, safe='')}",
-        headers=_auth_headers(identity, username),
+        "GET", f"{args.server}/inbox/{quote(user_id, safe='')}",
+        headers=_auth_headers(identity, user_id),
     )
     if not messages:
         print("inbox empty")
         return 0
     read_ids = []
     for msg in messages:
-        keys = _request("GET", f"{args.server}/keys/{quote(msg['sender'], safe='')}")
+        keys = _request("GET", f"{args.server}/keys/{quote(msg['sender_id'], safe='')}")
         try:
-            text = decrypt_message(
-                identity, username, keys["signing_pub"], msg["envelope"]
+            payload = decrypt_message(
+                identity, user_id, keys["signing_pub"], msg["envelope"], username
             )
         except Exception:
-            print(f"  [!] message #{msg['id']} from {msg['sender']}: "
+            print(f"  [!] message #{msg['id']}: "
                   f"signature/decryption FAILED — possible tampering, skipped")
             continue
         when = dt.datetime.fromtimestamp(msg["received_at"]).strftime("%Y-%m-%d %H:%M")
-        print(f"  [{when}] {msg['sender']}: {text}")
+        print(f"  [{when}] {payload['sender']}: {payload['message']}")
         read_ids.append(msg["id"])
     if read_ids and not args.keep:
         _request("POST", f"{args.server}/ack",
-                 {"username": username, "ids": read_ids},
-                 headers=_auth_headers(identity, username))
+                 {"address_id": user_id, "ids": read_ids},
+                 headers=_auth_headers(identity, user_id))
     return 0
 
 
