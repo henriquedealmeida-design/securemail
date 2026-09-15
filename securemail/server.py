@@ -1,26 +1,26 @@
 """Storage server — deliberately blind.
 
 The server keeps exactly two things:
-  1. a directory of usernames -> public keys
-  2. a queue of opaque encrypted envelopes per recipient
+  1. a directory of opaque address identifiers -> public keys
+  2. a queue of opaque encrypted envelopes per recipient identifier
 
-It has no private keys, no plaintext, no message metadata beyond sender name
-and arrival time. Built on the Python standard library + cryptography.
+It has no private keys, no plaintext, and no clear-text email addresses. Built
+on the Python standard library + cryptography.
 
 Security model (post-audit hardening):
 - /inbox and /ack require a request signature: the client signs
-  "{username}|{unix_timestamp}" with its Ed25519 key; the server verifies
+  "{address_id}|{unix_timestamp}" with its Ed25519 key; the server verifies
   against the registered public key. A 60-second window blocks replays.
 - /send requires the same signature from the declared sender — nobody can
   queue envelopes under someone else's name.
 - Request bodies are capped (64 KB) and per-IP rate limited.
 
 API:
-  POST /register      {"username", "signing_pub", "encryption_pub"}
-  GET  /keys/<user>   -> {"username", "signing_pub", "encryption_pub"}   (public)
-  POST /send          {"recipient", "envelope": {...}}   + auth headers
-  GET  /inbox/<user>  -> [{"id", "sender", "envelope", "received_at"}]   + auth
-  POST /ack           {"username", "ids": [...]}                          + auth
+  POST /register      {"address_id", "signing_pub", "encryption_pub"}
+  GET  /keys/<id>     -> {"address_id", "signing_pub", "encryption_pub"}  (public)
+  POST /send          {"recipient_id", "envelope": {...}}                 + auth headers
+  GET  /inbox/<id>    -> [{"id", "sender_id", "envelope", "received_at"}] + auth
+  POST /ack           {"address_id", "ids": [...]}                        + auth
 
 Auth headers: X-Timestamp (unix seconds), X-Signature (base64 Ed25519).
 """
@@ -33,7 +33,9 @@ import logging
 import sqlite3
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
+from .addressing import address_id, is_address_id, normalize_address
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 MAX_BODY = 64 * 1024          # 64 KB is ample for an envelope
@@ -49,7 +51,7 @@ audit = logging.getLogger("audit")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    username       TEXT PRIMARY KEY,
+    address_id     TEXT PRIMARY KEY,
     signing_pub    TEXT NOT NULL,
     encryption_pub TEXT NOT NULL,
     registered_at  REAL NOT NULL
@@ -57,13 +59,13 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE TABLE IF NOT EXISTS messages (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    recipient   TEXT NOT NULL,
-    sender      TEXT NOT NULL,
+    recipient_id TEXT NOT NULL,
+    sender_id    TEXT NOT NULL,
     envelope    TEXT NOT NULL,   -- JSON, opaque to us
     received_at REAL NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient);
+CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id);
 """
 
 # per-IP sliding-window rate limiter
@@ -74,67 +76,127 @@ class Store:
     def __init__(self, path: str):
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._migrate_legacy_schema()
         self.conn.executescript(SCHEMA)
         self.conn.commit()
 
-    def register(self, username: str, signing_pub: str, encryption_pub: str) -> bool:
+    def _table_columns(self, table: str) -> list[str]:
+        return [
+            str(row["name"])
+            for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        ]
+
+    def _migrate_legacy_schema(self) -> None:
+        user_columns = self._table_columns("users")
+        message_columns = self._table_columns("messages")
+        legacy_users = "username" in user_columns and "address_id" not in user_columns
+        legacy_messages = "recipient" in message_columns and "recipient_id" not in message_columns
+        if not legacy_users and not legacy_messages:
+            return
+        if legacy_users:
+            self.conn.execute("ALTER TABLE users RENAME TO users_legacy")
+        if legacy_messages:
+            self.conn.execute("ALTER TABLE messages RENAME TO messages_legacy")
+        self.conn.executescript(SCHEMA)
+        if legacy_users:
+            rows = self.conn.execute(
+                "SELECT username, signing_pub, encryption_pub, registered_at FROM users_legacy"
+            ).fetchall()
+            for row in rows:
+                migrated_id = address_id(normalize_address(str(row["username"])))
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO users (address_id, signing_pub, encryption_pub, registered_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (
+                        migrated_id,
+                        row["signing_pub"],
+                        row["encryption_pub"],
+                        row["registered_at"],
+                    ),
+                )
+            self.conn.execute("DROP TABLE users_legacy")
+        if legacy_messages:
+            rows = self.conn.execute(
+                "SELECT id, recipient, sender, envelope, received_at FROM messages_legacy"
+            ).fetchall()
+            for row in rows:
+                recipient_address = normalize_address(str(row["recipient"]))
+                sender_address = normalize_address(str(row["sender"]))
+                envelope = json.loads(row["envelope"])
+                if "sender" in envelope:
+                    envelope["sender"] = normalize_address(str(envelope["sender"]))
+                self.conn.execute(
+                    "INSERT INTO messages (id, recipient_id, sender_id, envelope, received_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        row["id"],
+                        address_id(recipient_address),
+                        address_id(sender_address),
+                        json.dumps(envelope),
+                        row["received_at"],
+                    ),
+                )
+            self.conn.execute("DROP TABLE messages_legacy")
+        self.conn.commit()
+
+    def register(self, address_id: str, signing_pub: str, encryption_pub: str) -> bool:
         try:
             self.conn.execute(
                 "INSERT INTO users VALUES (?, ?, ?, ?)",
-                (username, signing_pub, encryption_pub, time.time()),
+                (address_id, signing_pub, encryption_pub, time.time()),
             )
             self.conn.commit()
             return True
         except sqlite3.IntegrityError:
             return False
 
-    def get_keys(self, username: str) -> dict | None:
+    def get_keys(self, address_id: str) -> dict | None:
         row = self.conn.execute(
-            "SELECT username, signing_pub, encryption_pub FROM users WHERE username = ?",
-            (username,),
+            "SELECT address_id, signing_pub, encryption_pub FROM users WHERE address_id = ?",
+            (address_id,),
         ).fetchone()
         return dict(row) if row else None
 
-    def get_signing_key(self, username: str) -> str | None:
+    def get_signing_key(self, address_id: str) -> str | None:
         row = self.conn.execute(
-            "SELECT signing_pub FROM users WHERE username = ?", (username,)
+            "SELECT signing_pub FROM users WHERE address_id = ?", (address_id,)
         ).fetchone()
         return str(row["signing_pub"]) if row else None
 
-    def store_message(self, recipient: str, sender: str, envelope: dict) -> None:
+    def store_message(self, recipient_id: str, sender_id: str, envelope: dict) -> None:
         self.conn.execute(
-            "INSERT INTO messages (recipient, sender, envelope, received_at)"
+            "INSERT INTO messages (recipient_id, sender_id, envelope, received_at)"
             " VALUES (?, ?, ?, ?)",
-            (recipient, sender, json.dumps(envelope), time.time()),
+            (recipient_id, sender_id, json.dumps(envelope), time.time()),
         )
         self.conn.commit()
 
-    def inbox(self, username: str) -> list[dict]:
+    def inbox(self, address_id: str) -> list[dict]:
         rows = self.conn.execute(
-            "SELECT id, sender, envelope, received_at FROM messages"
-            " WHERE recipient = ? ORDER BY id",
-            (username,),
+            "SELECT id, sender_id, envelope, received_at FROM messages"
+            " WHERE recipient_id = ? ORDER BY id",
+            (address_id,),
         ).fetchall()
         return [
             {
                 "id": r["id"],
-                "sender": r["sender"],
+                "sender_id": r["sender_id"],
                 "envelope": json.loads(r["envelope"]),
                 "received_at": r["received_at"],
             }
             for r in rows
         ]
 
-    def ack(self, username: str, ids: list[int]) -> None:
+    def ack(self, address_id: str, ids: list[int]) -> None:
         self.conn.executemany(
-            "DELETE FROM messages WHERE id = ? AND recipient = ?",
-            [(i, username) for i in ids],
+            "DELETE FROM messages WHERE id = ? AND recipient_id = ?",
+            [(i, address_id) for i in ids],
         )
         self.conn.commit()
 
 
-def verify_requester(store: Store, username: str, headers) -> bool:
-    """Verify an Ed25519 request signature over "{username}|{timestamp}".
+def verify_requester(store: Store, address_id: str, headers) -> bool:
+    """Verify an Ed25519 request signature over "{address_id}|{timestamp}".
 
     The registered public signing key authenticates the request; the
     timestamp window (60 s) blocks replay of captured requests.
@@ -146,11 +208,11 @@ def verify_requester(store: Store, username: str, headers) -> bool:
     try:
         if abs(time.time() - float(ts)) > AUTH_WINDOW:
             return False
-        pub_b64 = store.get_signing_key(username)
+        pub_b64 = store.get_signing_key(address_id)
         if pub_b64 is None:
             return False
         pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(pub_b64))
-        pub.verify(base64.b64decode(sig_b64), f"{username}|{ts}".encode())
+        pub.verify(base64.b64decode(sig_b64), f"{address_id}|{ts}".encode())
         return True
     except Exception:
         return False
@@ -174,6 +236,11 @@ def make_handler(store: Store):
                 raise ValueError("body too large")
             return json.loads(self.rfile.read(length) or b"{}")
 
+        def _address_id(self, value: str) -> str:
+            if not is_address_id(value):
+                raise ValueError("invalid address identifier")
+            return value
+
         def _reply(self, code: int, payload: dict | list) -> None:
             body = json.dumps(payload).encode("utf-8")
             self.send_response(code)
@@ -193,35 +260,37 @@ def make_handler(store: Store):
             try:
                 body = self._json_body()
                 if self.path == "/register":
+                    address_id = self._address_id(body["address_id"])
                     ok = store.register(
-                        body["username"], body["signing_pub"], body["encryption_pub"]
+                        address_id, body["signing_pub"], body["encryption_pub"]
                     )
-                    audit.info("register user=%s ok=%s ip=%s",
-                               body["username"], ok, self.client_address[0])
+                    audit.info("register ok=%s ip=%s", ok, self.client_address[0])
                     self._reply(201 if ok else 409, {"registered": ok})
                 elif self.path == "/send":
                     env = body["envelope"]
-                    if store.get_keys(env["sender"]) is None:
+                    sender_id = self._address_id(env["sender_id"])
+                    recipient_id = self._address_id(body["recipient_id"])
+                    env["sender_id"] = sender_id
+                    if store.get_keys(sender_id) is None:
                         self._reply(403, {"error": "unregistered sender"})
                         return
-                    if not verify_requester(store, env["sender"], self.headers):
+                    if not verify_requester(store, sender_id, self.headers):
                         self._reply(403, {"error": "sender signature required"})
                         return
-                    if store.get_keys(body["recipient"]) is None:
+                    if store.get_keys(recipient_id) is None:
                         self._reply(404, {"error": "unknown recipient"})
                         return
-                    store.store_message(body["recipient"], env["sender"], env)
-                    audit.info("send sender=%s recipient=%s ip=%s",
-                               env["sender"], body["recipient"],
-                               self.client_address[0])
+                    store.store_message(recipient_id, sender_id, env)
+                    audit.info("send queued ip=%s", self.client_address[0])
                     self._reply(202, {"queued": True})
                 elif self.path == "/ack":
-                    if not verify_requester(store, body["username"], self.headers):
+                    address_id = self._address_id(body["address_id"])
+                    if not verify_requester(store, address_id, self.headers):
                         self._reply(403, {"error": "signature required"})
                         return
-                    store.ack(body["username"], body.get("ids", []))
-                    audit.info("ack user=%s n=%d ip=%s", body["username"],
-                               len(body.get("ids", [])), self.client_address[0])
+                    store.ack(address_id, body.get("ids", []))
+                    audit.info("ack n=%d ip=%s", len(body.get("ids", [])),
+                               self.client_address[0])
                     self._reply(200, {"acked": True})
                 else:
                     self._reply(404, {"error": "not found"})
@@ -234,21 +303,21 @@ def make_handler(store: Store):
             if not self._rate_ok():
                 self._reply(429, {"error": "rate limit exceeded"})
                 return
-            if self.path.startswith("/keys/"):
-                username = self.path.removeprefix("/keys/")
-                keys = store.get_keys(username)
+            path = urlparse(self.path).path
+            if path.startswith("/keys/"):
+                address_id = self._address_id(path.removeprefix("/keys/"))
+                keys = store.get_keys(address_id)
                 if keys is None:
                     self._reply(404, {"error": "unknown user"})
                 else:
                     self._reply(200, keys)
-            elif self.path.startswith("/inbox/"):
-                username = self.path.removeprefix("/inbox/")
-                if not verify_requester(store, username, self.headers):
-                    audit.info("inbox-denied user=%s ip=%s",
-                               username, self.client_address[0])
+            elif path.startswith("/inbox/"):
+                address_id = self._address_id(path.removeprefix("/inbox/"))
+                if not verify_requester(store, address_id, self.headers):
+                    audit.info("inbox-denied ip=%s", self.client_address[0])
                     self._reply(403, {"error": "signature required"})
                     return
-                self._reply(200, store.inbox(username))
+                self._reply(200, store.inbox(address_id))
             else:
                 self._reply(404, {"error": "not found"})
 
@@ -259,8 +328,8 @@ def run(host: str = "127.0.0.1", port: int = 8471, db_path: str = "securemail.db
     store = Store(db_path)
     server = ThreadingHTTPServer((host, port), make_handler(store))
     print(f"securemail server listening on http://{host}:{port} (db: {db_path})")
-    print("the server stores public keys and encrypted envelopes only.")
-    print("inbox/ack/send require an request signature.")
+    print("the server stores only opaque address identifiers and encrypted envelopes.")
+    print("inbox/ack/send require a signed request.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

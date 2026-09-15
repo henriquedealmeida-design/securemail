@@ -1,6 +1,7 @@
 # securemail
 
-End-to-end encrypted messaging prototype — **the server never sees a single word of plaintext**.
+End-to-end encrypted messaging prototype — **the server never sees a single
+word of plaintext or your clear-text email address**.
 
 Most "encrypted" messaging systems encrypt in transit and store plaintext (or
 server-decryptable ciphertext) at rest. securemail explores the stricter
@@ -22,13 +23,14 @@ Sending a message:
 1. Generate an **ephemeral** X25519 keypair (fresh for every message).
 2. `ECDH(ephemeral_private, recipient_public)` → shared secret.
 3. `HKDF(secret, info = "securemail-v1|sender|recipient")` → 32-byte key.
-4. Encrypt with ChaCha20-Poly1305 (random 96-bit nonce).
-5. **Sign** `ephemeral_pub ‖ nonce ‖ ciphertext` with the sender's Ed25519 key.
+4. Derive an opaque private identifier from each normalized email address.
+5. Encrypt a private payload with ChaCha20-Poly1305 (random 96-bit nonce).
+6. **Sign** `ephemeral_pub ‖ nonce ‖ ciphertext` with the sender's Ed25519 key.
 
 What the server stores for a queued message:
 
 ```
-sender      : alice
+sender_id   : 5d5d1a0a4f...
 ciphertext  : Z9PDbEPmd4Q/UFYB4hkZpbNLlyaJYfWg/0adYgVHNPilZnlPmGqBHETQR+rQ ...
 nonce       : LgexcYNGEOpGumFt
 signature   : yXy6Ct2hCkgdy+HrSGMhTolrRaPiF8qZMy/utaQuegtnj9hc2ApWdvRCDBwe ...
@@ -46,33 +48,47 @@ pip install -r requirements.txt
 python -m securemail.server          # listens on 127.0.0.1:8471
 
 # 2. create two identities (private keys stay local, mode 0600)
-python -m securemail.client register alice
-python -m securemail.client register bob
+python -m securemail.client register henrique.de.almeida@securemail.local
+python -m securemail.client register contact@securemail.local
 
 # 3. send an encrypted message
-python -m securemail.client send alice bob "meet at 18:00, usual place"
+python -m securemail.client send henrique.de.almeida@securemail.local contact@securemail.local "meet at 18:00, usual place"
 
-# 4. bob fetches, verifies and decrypts
-python -m securemail.client inbox bob
+# 4. the recipient fetches, verifies and decrypts
+python -m securemail.client inbox contact@securemail.local
 ```
 
 Identities live in `~/.securemail/<username>.json` with `0600` permissions,
 like an SSH private key. Only the *public* keys are uploaded to the server.
 
+`securemail` now accepts real email-style identities directly. If you prefer
+typing only the local part, pass `--domain securemail.local` (or export
+`SECUREMAIL_DOMAIN=securemail.local`) and commands such as
+`python -m securemail.client register henrique.de.almeida` are expanded to
+`henrique.de.almeida@securemail.local`.
+
+The server never stores or logs that clear-text address. Clients derive a
+stable SHA-256 identifier from the normalized address and the server only sees
+that opaque identifier plus encrypted envelopes. The sender address is embedded
+inside the encrypted payload, so only the recipient learns it after successful
+decryption.
+
 ## Security properties
 
 - **Confidentiality against the server** — it only ever handles ciphertext.
+- **Private addressing** — the server only stores opaque address identifiers,
+  not your real email address.
 - **Authenticity** — Ed25519 signatures; a forged sender key is rejected.
 - **Integrity** — Poly1305 tag; any bit-flip in transit is detected.
 - **Per-message forward secrecy of content keys** — each message uses a fresh
   ephemeral key; leaking one message key reveals nothing about others.
 - **Authenticated API access** — `/inbox`, `/ack` and `/send` require a
-  request signature (`Ed25519` over `"{username}|{timestamp}"`, verified
+  request signature (`Ed25519` over `"{address_id}|{timestamp}"`, verified
   against the registered public key, 60-second anti-replay window). Nobody
   can read, delete, or queue mail under someone else's name.
 - **Abuse resistance** — request bodies capped at 64 KB, per-IP rate
-  limiting, audit log of security events (registrations, sends, denied
-  accesses) with no envelope or key material ever logged.
+  limiting, audit log of security events with no clear-text addresses,
+  envelope contents, or key material ever logged.
 
 The hardening above followed an OWASP Top 10 self-review; the remaining
 known gaps are listed below.
@@ -82,8 +98,8 @@ known gaps are listed below.
 - No **asynchronous forward secrecy** for the long-term encryption key —
   stealing a recipient's identity file decrypts their stored envelopes.
   A real deployment would add the X3DH + Double Ratchet protocols.
-- No protection of **metadata** (who talks to whom, when) beyond requiring
-  authentication to read queues.
+- No protection of **metadata** timing or network source information; the
+  server still observes connection times and client IPs.
 - The public-key directory is trusted — a malicious server could swap keys.
   Mitigation: out-of-band key fingerprint verification (not implemented).
 - Plain HTTP by default — bind stays on 127.0.0.1; put the server behind a

@@ -1,0 +1,2 @@
+cd /home/runner/work/securemail/securemail
+python -m securemail.client --domain securemail.local workspace henrique.de.almeida
