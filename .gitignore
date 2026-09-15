@@ -3,3 +3,4 @@ __pycache__/
 securemail.db
 securemail-audit.log
 .pytest_cache/
+securemail-audit.log
