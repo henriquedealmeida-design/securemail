@@ -46,18 +46,24 @@ pip install -r requirements.txt
 python -m securemail.server          # listens on 127.0.0.1:8471
 
 # 2. create two identities (private keys stay local, mode 0600)
-python -m securemail.client register alice
-python -m securemail.client register bob
+python -m securemail.client register henrique.de.almeida@securemail.local
+python -m securemail.client register contact@securemail.local
 
 # 3. send an encrypted message
-python -m securemail.client send alice bob "meet at 18:00, usual place"
+python -m securemail.client send henrique.de.almeida@securemail.local contact@securemail.local "meet at 18:00, usual place"
 
-# 4. bob fetches, verifies and decrypts
-python -m securemail.client inbox bob
+# 4. the recipient fetches, verifies and decrypts
+python -m securemail.client inbox contact@securemail.local
 ```
 
 Identities live in `~/.securemail/<username>.json` with `0600` permissions,
 like an SSH private key. Only the *public* keys are uploaded to the server.
+
+`securemail` now accepts real email-style identities directly. If you prefer
+typing only the local part, pass `--domain securemail.local` (or export
+`SECUREMAIL_DOMAIN=securemail.local`) and commands such as
+`python -m securemail.client register henrique.de.almeida` are expanded to
+`henrique.de.almeida@securemail.local`.
 
 ## Security properties
 

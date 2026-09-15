@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 
+from securemail.addressing import identity_filename, normalize_address
 from securemail.crypto import Identity
 from securemail.server import (AUTH_WINDOW, MAX_BODY, RATE_LIMIT, Store,
                                verify_requester)
@@ -67,6 +68,30 @@ class GuardConfigTest(unittest.TestCase):
         self.assertLessEqual(MAX_BODY, 1024 * 1024)   # never allow megabytes
         self.assertLessEqual(RATE_LIMIT, 1000)
         self.assertLessEqual(AUTH_WINDOW, 300)
+
+
+class AddressingTest(unittest.TestCase):
+    def test_email_is_normalized(self):
+        self.assertEqual(
+            normalize_address("Henrique.De.Almeida@Example.COM"),
+            "henrique.de.almeida@example.com",
+        )
+
+    def test_local_part_expands_to_default_domain(self):
+        self.assertEqual(
+            normalize_address("henrique.de.almeida", "securemail.local"),
+            "henrique.de.almeida@securemail.local",
+        )
+
+    def test_invalid_address_rejected(self):
+        with self.assertRaises(ValueError):
+            normalize_address("henrique/de/almeida")
+
+    def test_identity_filename_is_path_safe(self):
+        self.assertEqual(
+            identity_filename("henrique.de.almeida+vip@example.com"),
+            "henrique.de.almeida%2Bvip%40example.com.json",
+        )
 
 
 if __name__ == "__main__":

@@ -33,7 +33,9 @@ import logging
 import sqlite3
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlparse
 
+from .addressing import normalize_address
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 MAX_BODY = 64 * 1024          # 64 KB is ample for an envelope
@@ -193,34 +195,39 @@ def make_handler(store: Store):
             try:
                 body = self._json_body()
                 if self.path == "/register":
+                    username = normalize_address(body["username"])
                     ok = store.register(
-                        body["username"], body["signing_pub"], body["encryption_pub"]
+                        username, body["signing_pub"], body["encryption_pub"]
                     )
                     audit.info("register user=%s ok=%s ip=%s",
-                               body["username"], ok, self.client_address[0])
+                               username, ok, self.client_address[0])
                     self._reply(201 if ok else 409, {"registered": ok})
                 elif self.path == "/send":
                     env = body["envelope"]
-                    if store.get_keys(env["sender"]) is None:
+                    sender = normalize_address(env["sender"])
+                    recipient = normalize_address(body["recipient"])
+                    env["sender"] = sender
+                    if store.get_keys(sender) is None:
                         self._reply(403, {"error": "unregistered sender"})
                         return
-                    if not verify_requester(store, env["sender"], self.headers):
+                    if not verify_requester(store, sender, self.headers):
                         self._reply(403, {"error": "sender signature required"})
                         return
-                    if store.get_keys(body["recipient"]) is None:
+                    if store.get_keys(recipient) is None:
                         self._reply(404, {"error": "unknown recipient"})
                         return
-                    store.store_message(body["recipient"], env["sender"], env)
+                    store.store_message(recipient, sender, env)
                     audit.info("send sender=%s recipient=%s ip=%s",
-                               env["sender"], body["recipient"],
+                               sender, recipient,
                                self.client_address[0])
                     self._reply(202, {"queued": True})
                 elif self.path == "/ack":
-                    if not verify_requester(store, body["username"], self.headers):
+                    username = normalize_address(body["username"])
+                    if not verify_requester(store, username, self.headers):
                         self._reply(403, {"error": "signature required"})
                         return
-                    store.ack(body["username"], body.get("ids", []))
-                    audit.info("ack user=%s n=%d ip=%s", body["username"],
+                    store.ack(username, body.get("ids", []))
+                    audit.info("ack user=%s n=%d ip=%s", username,
                                len(body.get("ids", [])), self.client_address[0])
                     self._reply(200, {"acked": True})
                 else:
@@ -234,15 +241,16 @@ def make_handler(store: Store):
             if not self._rate_ok():
                 self._reply(429, {"error": "rate limit exceeded"})
                 return
-            if self.path.startswith("/keys/"):
-                username = self.path.removeprefix("/keys/")
+            path = urlparse(self.path).path
+            if path.startswith("/keys/"):
+                username = normalize_address(unquote(path.removeprefix("/keys/")))
                 keys = store.get_keys(username)
                 if keys is None:
                     self._reply(404, {"error": "unknown user"})
                 else:
                     self._reply(200, keys)
-            elif self.path.startswith("/inbox/"):
-                username = self.path.removeprefix("/inbox/")
+            elif path.startswith("/inbox/"):
+                username = normalize_address(unquote(path.removeprefix("/inbox/")))
                 if not verify_requester(store, username, self.headers):
                     audit.info("inbox-denied user=%s ip=%s",
                                username, self.client_address[0])

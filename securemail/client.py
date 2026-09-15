@@ -24,7 +24,9 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import quote
 
+from .addressing import DEFAULT_DOMAIN, identity_filename, normalize_address
 from .crypto import Identity, decrypt_message, encrypt_message
 
 DEFAULT_SERVER = "http://127.0.0.1:8471"
@@ -59,19 +61,27 @@ def _auth_headers(identity: Identity, username: str) -> dict:
     return {"X-Timestamp": ts, "X-Signature": base64.b64encode(sig).decode()}
 
 
-def _identity_path(username: str) -> Path:
-    return IDENTITY_DIR / f"{username}.json"
+def _normalize_cli_address(address: str, default_domain: str) -> str:
+    try:
+        return normalize_address(address, default_domain)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
 
 
-def _load_identity(username: str) -> Identity:
-    path = _identity_path(username)
+def _identity_path(address: str) -> Path:
+    return IDENTITY_DIR / identity_filename(address)
+
+
+def _load_identity(address: str) -> Identity:
+    path = _identity_path(address)
     if not path.exists():
-        raise SystemExit(f"no identity for '{username}' — run: register {username}")
+        raise SystemExit(f"no identity for '{address}' — run: register {address}")
     return Identity.load(str(path))
 
 
 def cmd_register(args) -> int:
-    path = _identity_path(args.username)
+    username = _normalize_cli_address(args.username, args.domain)
+    path = _identity_path(username)
     if path.exists():
         print(f"identity already exists: {path}")
         return 1
@@ -81,49 +91,52 @@ def cmd_register(args) -> int:
     result = _request(
         "POST", f"{args.server}/register",
         {
-            "username": args.username,
+            "username": username,
             "signing_pub": identity.public_signing_b64(),
             "encryption_pub": identity.public_encryption_b64(),
         },
     )
     if result.get("registered"):
-        print(f"registered '{args.username}' — identity stored in {path} (mode 0600)")
+        print(f"registered '{username}' — identity stored in {path} (mode 0600)")
         return 0
-    print(f"username '{args.username}' is already taken on this server")
+    print(f"username '{username}' is already taken on this server")
     return 1
 
 
 def cmd_send(args) -> int:
-    identity = _load_identity(args.sender)
-    keys = _request("GET", f"{args.server}/keys/{args.recipient}")
+    sender = _normalize_cli_address(args.sender, args.domain)
+    recipient = _normalize_cli_address(args.recipient, args.domain)
+    identity = _load_identity(sender)
+    keys = _request("GET", f"{args.server}/keys/{quote(recipient, safe='')}")
     envelope = encrypt_message(
-        identity, args.sender, args.recipient, keys["encryption_pub"], args.message
+        identity, sender, recipient, keys["encryption_pub"], args.message
     )
     _request(
         "POST", f"{args.server}/send",
-        {"recipient": args.recipient, "envelope": envelope},
-        headers=_auth_headers(identity, args.sender),
+        {"recipient": recipient, "envelope": envelope},
+        headers=_auth_headers(identity, sender),
     )
-    print(f"message encrypted and queued for '{args.recipient}'")
+    print(f"message encrypted and queued for '{recipient}'")
     print("the server only sees an opaque envelope — not a single word of content.")
     return 0
 
 
 def cmd_inbox(args) -> int:
-    identity = _load_identity(args.username)
+    username = _normalize_cli_address(args.username, args.domain)
+    identity = _load_identity(username)
     messages = _request(
-        "GET", f"{args.server}/inbox/{args.username}",
-        headers=_auth_headers(identity, args.username),
+        "GET", f"{args.server}/inbox/{quote(username, safe='')}",
+        headers=_auth_headers(identity, username),
     )
     if not messages:
         print("inbox empty")
         return 0
     read_ids = []
     for msg in messages:
-        keys = _request("GET", f"{args.server}/keys/{msg['sender']}")
+        keys = _request("GET", f"{args.server}/keys/{quote(msg['sender'], safe='')}")
         try:
             text = decrypt_message(
-                identity, args.username, keys["signing_pub"], msg["envelope"]
+                identity, username, keys["signing_pub"], msg["envelope"]
             )
         except Exception:
             print(f"  [!] message #{msg['id']} from {msg['sender']}: "
@@ -134,8 +147,8 @@ def cmd_inbox(args) -> int:
         read_ids.append(msg["id"])
     if read_ids and not args.keep:
         _request("POST", f"{args.server}/ack",
-                 {"username": args.username, "ids": read_ids},
-                 headers=_auth_headers(identity, args.username))
+                 {"username": username, "ids": read_ids},
+                 headers=_auth_headers(identity, username))
     return 0
 
 
@@ -145,6 +158,8 @@ def main(argv: list[str] | None = None) -> int:
         description="End-to-end encrypted messaging — the server never sees plaintext",
     )
     parser.add_argument("--server", default=DEFAULT_SERVER)
+    parser.add_argument("--domain", default=DEFAULT_DOMAIN,
+                        help="default domain appended when an address has no @")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_reg = sub.add_parser("register", help="create an identity and publish public keys")
