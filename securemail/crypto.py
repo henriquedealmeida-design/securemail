@@ -130,10 +130,19 @@ def _derive_key(shared_secret: bytes, sender: str, recipient: str) -> bytes:
     ).derive(shared_secret)
 
 
+def _encode_payload(sender_address: str, plaintext: str) -> bytes:
+    return json.dumps(
+        {"sender": sender_address, "message": plaintext},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def encrypt_message(
     identity: Identity,
-    sender: str,
-    recipient: str,
+    sender_address: str,
+    sender_id: str,
+    recipient_id: str,
     recipient_encryption_pub_b64: str,
     plaintext: str,
 ) -> dict:
@@ -143,10 +152,12 @@ def encrypt_message(
         _unb64(recipient_encryption_pub_b64)
     )
     shared = ephemeral.exchange(recipient_pub)
-    key = _derive_key(shared, sender, recipient)
+    key = _derive_key(shared, sender_id, recipient_id)
 
     nonce = os.urandom(12)
-    ciphertext = ChaCha20Poly1305(key).encrypt(nonce, plaintext.encode("utf-8"), None)
+    ciphertext = ChaCha20Poly1305(key).encrypt(
+        nonce, _encode_payload(sender_address, plaintext), None
+    )
 
     ephemeral_pub = ephemeral.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw
@@ -155,7 +166,7 @@ def encrypt_message(
     signature = identity.signing_key.sign(signed_blob)
 
     return {
-        "sender": sender,
+        "sender_id": sender_id,
         "ephemeral_pub": _b64(ephemeral_pub),
         "nonce": _b64(nonce),
         "ciphertext": _b64(ciphertext),
@@ -165,10 +176,11 @@ def encrypt_message(
 
 def decrypt_message(
     identity: Identity,
-    recipient: str,
+    recipient_id: str,
     sender_signing_pub_b64: str,
     envelope: dict,
-) -> str:
+    recipient_address: str | None = None,
+) -> dict:
     """Verify the signature then decrypt. Raises on any tampering."""
     ephemeral_pub_bytes = _unb64(envelope["ephemeral_pub"])
     nonce = _unb64(envelope["nonce"])
@@ -184,7 +196,18 @@ def decrypt_message(
     # 2. Rebuild the shared secret and decrypt.
     ephemeral_pub = x25519.X25519PublicKey.from_public_bytes(ephemeral_pub_bytes)
     shared = identity.encryption_key.exchange(ephemeral_pub)
-    key = _derive_key(shared, envelope["sender"], recipient)
+    sender_binding = envelope.get("sender_id")
+    if sender_binding is None:
+        sender_binding = envelope["sender"]
+    recipient_binding = recipient_id
+    if "sender_id" not in envelope:
+        recipient_binding = recipient_address or recipient_id
+    key = _derive_key(shared, sender_binding, recipient_binding)
 
     plaintext = ChaCha20Poly1305(key).decrypt(nonce, ciphertext, None)
-    return plaintext.decode("utf-8")
+    decoded = plaintext.decode("utf-8")
+    try:
+        payload = json.loads(decoded)
+        return {"sender": payload["sender"], "message": payload["message"]}
+    except (KeyError, json.JSONDecodeError):
+        return {"sender": envelope["sender"], "message": decoded}
